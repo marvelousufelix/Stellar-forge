@@ -203,8 +203,8 @@ export class IPFSService {
     let response: Response
     try {
       response = await withRetry(
-        () =>
-          fetch(`${IPFS_CONFIG.pinataApiUrl}/pinning/pinJSONToIPFS`, {
+        async () => {
+          const res = await fetch(`${IPFS_CONFIG.pinataApiUrl}/pinning/pinJSONToIPFS`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -212,22 +212,35 @@ export class IPFSService {
               pinata_secret_api_key: IPFS_CONFIG.apiSecret,
             },
             body: JSON.stringify(body),
-          }),
+          })
+          // Throw on transient server errors so withRetry can retry them.
+          // 401 is non-retryable (auth failure) — let it fall through.
+          if (res.status !== 401 && !res.ok) {
+            const err = Object.assign(new Error(`HTTP ${res.status}`), { status: res.status })
+            throw err
+          }
+          return res
+        },
         { shouldRetry: isTransientError }
       )
-    } catch {
+    } catch (err) {
+      // Re-throw IPFSUploadError as-is (shouldn't happen here, but be safe)
+      if (err instanceof IPFSUploadError) throw err
+      const status = (err as { status?: number }).status
+      if (status === undefined) {
+        // Pure network error
+        throw new IPFSUploadError(
+          'Network error during metadata upload. Check your connection and try again.'
+        )
+      }
+      // HTTP error that exhausted retries
       throw new IPFSUploadError(
-        'Network error during metadata upload. Check your connection and try again.'
+        `Metadata upload failed (HTTP ${status}). Please try again.`
       )
     }
 
     if (response.status === 401) {
       throw new IPFSUploadError('Pinata authentication failed. Check your API key and secret.')
-    }
-    if (!response.ok) {
-      throw new IPFSUploadError(
-        `Metadata upload failed (HTTP ${response.status}). Please try again.`
-      )
     }
 
     let data: { IpfsHash: string }
