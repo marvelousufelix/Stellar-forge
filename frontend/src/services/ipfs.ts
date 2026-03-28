@@ -188,8 +188,8 @@ export class IPFSService {
     let response: Response
     try {
       response = await withRetry(
-        () =>
-          fetch(`${IPFS_CONFIG.pinataApiUrl}/pinning/pinJSONToIPFS`, {
+        async () => {
+          const res = await fetch(`${IPFS_CONFIG.pinataApiUrl}/pinning/pinJSONToIPFS`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -200,7 +200,17 @@ export class IPFSService {
           }),
         { shouldRetry: isTransientError },
       )
-    } catch {
+    } catch (err) {
+      // Re-throw IPFSUploadError as-is (shouldn't happen here, but be safe)
+      if (err instanceof IPFSUploadError) throw err
+      const status = (err as { status?: number }).status
+      if (status === undefined) {
+        // Pure network error
+        throw new IPFSUploadError(
+          'Network error during metadata upload. Check your connection and try again.'
+        )
+      }
+      // HTTP error that exhausted retries
       throw new IPFSUploadError(
         'Network error during metadata upload. Check your connection and try again.',
       )
