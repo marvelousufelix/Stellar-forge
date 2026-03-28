@@ -148,7 +148,8 @@ fn test_set_metadata() {
     let admin = Address::generate(&s.env);
     s.fund(&admin, 500);
 
-    let token_addr = s.new_token(&admin);
+    // seed_token_with_burn registers the token + idx mapping the contract needs
+    let token_addr = seed_token_with_burn(&s, &admin, true);
     s.client.set_metadata(
         &token_addr, &admin,
         &String::from_str(&s.env, "ipfs://Qm123"),
@@ -178,7 +179,7 @@ fn test_set_metadata_already_set() {
     let admin = Address::generate(&s.env);
     s.fund(&admin, 1_000);
 
-    let token_addr = s.new_token(&admin);
+    let token_addr = seed_token_with_burn(&s, &admin, true);
 
     // First call succeeds
     s.client.set_metadata(
@@ -202,8 +203,9 @@ fn test_set_metadata_different_tokens_independent() {
     let admin = Address::generate(&s.env);
     s.fund(&admin, 1_000);
 
-    let token_a = s.new_token(&admin);
-    let token_b = s.new_token(&admin);
+    // Each call to seed_token_with_burn registers a distinct token + idx entry
+    let token_a = seed_token_with_burn(&s, &admin, true);
+    let token_b = seed_token_with_burn(&s, &admin, true);
 
     // Setting metadata on two different tokens should both succeed
     s.client.set_metadata(
@@ -264,7 +266,8 @@ fn test_mint_tokens() {
     let token_admin = Address::generate(&s.env);
     s.fund(&token_admin, 1_000);
 
-    let token_addr = s.new_token(&token_admin);
+    // seed_token_with_burn registers the token + idx mapping the contract needs
+    let token_addr = seed_token_with_burn(&s, &token_admin, true);
     let recipient = Address::generate(&s.env);
 
     s.client.mint_tokens(&token_addr, &token_admin, &recipient, &5_000, &1_000);
@@ -354,7 +357,9 @@ fn test_burn_disabled_returns_error() {
     let creator = Address::generate(&s.env);
     let token_addr = seed_token_with_burn(&s, &creator, false);
 
+    // Give the burner a balance so the contract reaches the burn_enabled check
     let burner = Address::generate(&s.env);
+    StellarAssetClient::new(&s.env, &token_addr).mint(&burner, &100);
     assert_eq!(
         s.client.try_burn(&token_addr, &burner, &100),
         Err(Ok(Error::BurnNotEnabled))
@@ -369,7 +374,9 @@ fn test_set_burn_enabled_disables_burn() {
 
     s.client.set_burn_enabled(&token_addr, &creator, &false);
 
+    // Give the burner a balance so the contract reaches the burn_enabled check
     let burner = Address::generate(&s.env);
+    StellarAssetClient::new(&s.env, &token_addr).mint(&burner, &100);
     assert_eq!(
         s.client.try_burn(&token_addr, &burner, &100),
         Err(Ok(Error::BurnNotEnabled))
@@ -525,7 +532,90 @@ fn test_transfer_admin_same_address_fails() {
     );
 }
 
-// ── get_tokens_by_creator ─────────────────────────────────────────────────────
+// ── reentrancy guard ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_reentrancy_guard_blocks_concurrent_call() {
+    let s = Setup::new();
+    let creator = Address::generate(&s.env);
+
+    // Manually set locked = true in factory state to simulate a call already in progress
+    s.env.as_contract(&s.client.address, || {
+        let mut state: FactoryState = s.env.storage().instance()
+            .get(&symbol_short!("state")).unwrap();
+        state.locked = true;
+        s.env.storage().instance().set(&symbol_short!("state"), &state);
+    });
+
+    // A second create_token call while locked should return Reentrancy
+    let result = s.client.try_create_token(
+        &creator, &s.salt(0), &s.dummy_hash(),
+        &String::from_str(&s.env, "T"),
+        &String::from_str(&s.env, "T"),
+        &7, &0, &1_000,
+    );
+    assert_eq!(result, Err(Ok(Error::Reentrancy)));
+}
+
+#[test]
+fn test_reentrancy_guard_released_after_error() {
+    let s = Setup::new();
+    let creator = Address::generate(&s.env);
+
+    // Trigger an error path (insufficient fee) — guard must be released afterwards
+    let _ = s.client.try_create_token(
+        &creator, &s.salt(0), &s.dummy_hash(),
+        &String::from_str(&s.env, "T"),
+        &String::from_str(&s.env, "T"),
+        &7, &0, &1, // fee too low → InsufficientFee
+    );
+
+    // After the failed call, locked must be false
+    s.env.as_contract(&s.client.address, || {
+        let state: FactoryState = s.env.storage().instance()
+            .get(&symbol_short!("state")).unwrap();
+        assert!(!state.locked, "lock should be released after an error");
+    });
+}
+
+#[test]
+fn test_initial_state_is_not_locked() {
+    let s = Setup::new();
+    s.env.as_contract(&s.client.address, || {
+        let state: FactoryState = s.env.storage().instance()
+            .get(&symbol_short!("state")).unwrap();
+        assert!(!state.locked);
+    });
+}
+
+// ── TTL ───────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_ttl_extended_after_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, TokenFactory);
+    let client = TokenFactoryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let fee_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+
+    client.initialize(&admin, &treasury, &fee_token, &1_000, &500);
+
+    // After initialize the instance TTL must be at least MIN_TTL ledgers.
+    // The test env starts at ledger 0; extend_ttl(100_000, 535_000) sets the
+    // live-until ledger to 535_000, so the TTL is 535_000 - current = 535_000.
+    env.as_contract(&contract_id, || {
+        let ttl = env.storage().instance().get_ttl();
+        assert!(
+            ttl >= super::MIN_TTL,
+            "instance TTL after initialize ({ttl}) must be >= MIN_TTL ({})",
+            super::MIN_TTL,
+        );
+    });
+}
 
 #[test]
 fn test_get_tokens_by_creator() {
@@ -542,8 +632,8 @@ fn test_get_tokens_by_creator() {
 
     let indices = s.client.get_tokens_by_creator(&creator);
     assert_eq!(indices.len(), 2);
-    assert_eq!(indices.get(0).unwrap(), 1);
-    assert_eq!(indices.get(1).unwrap(), 2);
+    assert_eq!(indices.get(0).expect("first token index missing"), 1);
+    assert_eq!(indices.get(1).expect("second token index missing"), 2);
 }
 
 #[test]
@@ -551,4 +641,175 @@ fn test_get_tokens_by_creator_empty_for_unknown() {
     let s = Setup::new();
     let stranger = Address::generate(&s.env);
     assert_eq!(s.client.get_tokens_by_creator(&stranger).len(), 0);
+}
+
+// ── arithmetic overflow protection ────────────────────────────────────────────
+
+#[test]
+fn test_token_count_overflow_protection() {
+    let s = Setup::new();
+    s.env.as_contract(&s.client.address, || {
+        let mut state: FactoryState = s.env.storage().instance()
+            .get(&symbol_short!("state")).unwrap();
+        
+        // Set token_count to max u32 value, simulating near-overflow state
+        state.token_count = u32::MAX;
+        s.env.storage().instance().set(&symbol_short!("state"), &state);
+    });
+
+    let creator = Address::generate(&s.env);
+    s.fund(&creator, 10_000);
+
+    // Attempting to create a token when token_count is at max should fail
+    let result = s.client.try_create_token(
+        &creator,
+        &s.salt(0),
+        &s.dummy_hash(),
+        &String::from_str(&s.env, "OverflowToken"),
+        &String::from_str(&s.env, "OVF"),
+        &6,
+        &0,
+        &5_000,
+    );
+    
+    // Should return ArithmeticOverflow error
+    assert_eq!(result, Err(Ok(Error::ArithmeticOverflow)));
+}
+
+#[test]
+fn test_mint_with_zero_amount_fails() {
+    let s = Setup::new();
+    let admin = Address::generate(&s.env);
+    let token_addr = s.new_token(&admin);
+    
+    s.fund(&admin, 2_000);
+    
+    // Manually register the token in factory storage
+    s.env.as_contract(&s.client.address, || {
+        s.env.storage().instance().set(&(token_addr.clone(), symbol_short!("idx")), &1u32);
+        s.env.storage().instance().set(&1u32, &TokenInfo {
+            name: String::from_str(&s.env, "Token"),
+            symbol: String::from_str(&s.env, "TKN"),
+            decimals: 6,
+            creator: admin.clone(),
+            created_at: 0,
+            burn_enabled: true,
+        });
+    });
+    
+    let to = Address::generate(&s.env);
+    
+    // Attempting to mint 0 tokens should fail
+    let result = s.client.try_mint_tokens(
+        &token_addr,
+        &admin,
+        &to,
+        &0,
+        &1_000,
+    );
+    
+    assert_eq!(result, Err(Ok(Error::InvalidParameters)));
+}
+
+#[test]
+fn test_mint_with_negative_amount_fails() {
+    let s = Setup::new();
+    let admin = Address::generate(&s.env);
+    let token_addr = s.new_token(&admin);
+    
+    s.fund(&admin, 2_000);
+    
+    // Manually register the token in factory storage
+    s.env.as_contract(&s.client.address, || {
+        s.env.storage().instance().set(&(token_addr.clone(), symbol_short!("idx")), &1u32);
+        s.env.storage().instance().set(&1u32, &TokenInfo {
+            name: String::from_str(&s.env, "Token"),
+            symbol: String::from_str(&s.env, "TKN"),
+            decimals: 6,
+            creator: admin.clone(),
+            created_at: 0,
+            burn_enabled: true,
+        });
+    });
+    
+    let to = Address::generate(&s.env);
+    
+    // Attempting to mint negative tokens should fail
+    let result = s.client.try_mint_tokens(
+        &token_addr,
+        &admin,
+        &to,
+        &-1_000,
+        &1_000,
+    );
+    
+    assert_eq!(result, Err(Ok(Error::InvalidParameters)));
+}
+
+#[test]
+fn test_burn_with_zero_amount_fails() {
+    let s = Setup::new();
+    let user = Address::generate(&s.env);
+    let token_addr = s.new_token(&user);
+    
+    // Attempt to burn 0 tokens
+    let result = s.client.try_burn(&token_addr, &user, &0);
+    assert_eq!(result, Err(Ok(Error::InvalidBurnAmount)));
+}
+
+#[test]
+fn test_burn_with_negative_amount_fails() {
+    let s = Setup::new();
+    let user = Address::generate(&s.env);
+    let token_addr = s.new_token(&user);
+    
+    // Attempt to burn negative tokens
+    let result = s.client.try_burn(&token_addr, &user, &-100);
+    assert_eq!(result, Err(Ok(Error::InvalidBurnAmount)));
+}
+
+#[test]
+fn test_burn_amount_exceeds_balance() {
+    let s = Setup::new();
+    let user = Address::generate(&s.env);
+    let token_addr = s.new_token(&user);
+    
+    // Mint some tokens to the user
+    let token_client = TokenClient::new(&s.env, &token_addr);
+    token_client.mint(&user, &100);
+    
+    // Attempt to burn more than balance
+    let result = s.client.try_burn(&token_addr, &user, &101);
+    assert_eq!(result, Err(Ok(Error::BurnAmountExceedsBalance)));
+}
+
+#[test]
+fn test_burn_at_exact_balance() {
+    let s = Setup::new();
+    let user = Address::generate(&s.env);
+    let token_addr = s.new_token(&user);
+    
+    // Register token in factory
+    s.env.as_contract(&s.client.address, || {
+        s.env.storage().instance().set(&(token_addr.clone(), symbol_short!("idx")), &1u32);
+        s.env.storage().instance().set(&1u32, &TokenInfo {
+            name: String::from_str(&s.env, "Token"),
+            symbol: String::from_str(&s.env, "TKN"),
+            decimals: 6,
+            creator: user.clone(),
+            created_at: 0,
+            burn_enabled: true,
+        });
+    });
+    
+    // Mint some tokens to the user
+    let token_client = TokenClient::new(&s.env, &token_addr);
+    token_client.mint(&user, &100);
+    
+    // Burn exactly the balance
+    let result = s.client.try_burn(&token_addr, &user, &100);
+    assert!(result.is_ok());
+    
+    // Verify balance is now 0
+    assert_eq!(token_client.balance(&user), 0);
 }

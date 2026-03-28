@@ -1,5 +1,8 @@
 #![no_std]
-#![deny(clippy::all)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::panic))]
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, contractclient,
@@ -29,6 +32,9 @@ pub struct TokenInfo {
 pub struct FactoryState {
     pub admin: Address,
     pub paused: bool,
+    /// Reentrancy guard flag. Set to `true` at the start of `create_token`
+    /// and cleared to `false` before returning (success or error).
+    pub locked: bool,
     pub treasury: Address,
     pub fee_token: Address,
     pub base_fee: i128,
@@ -49,10 +55,37 @@ pub enum Error {
     BurnNotEnabled = 8,
     InvalidBurnAmount = 9,
     ContractPaused = 10,
+    /// Soroban's execution model is single-threaded and atomic per transaction,
+    /// which eliminates classic EVM-style reentrancy. However, `create_token`
+    /// performs cross-contract calls (deploy + initialize + mint) that could
+    /// theoretically be chained in unexpected ways via a malicious token
+    /// contract. This guard adds defense-in-depth: if `create_token` is somehow
+    /// re-entered before the first invocation completes, the second call is
+    /// rejected immediately rather than corrupting factory state.
+    Reentrancy = 11,
+    /// Integer overflow error during arithmetic operations (fee calculation, token count, etc.)
+    ArithmeticOverflow = 12,
+    /// Storage read failed - contract state not found
+    StateNotFound = 13,
 }
 
 #[contract]
 pub struct TokenFactory;
+
+// ── TTL constants ─────────────────────────────────────────────────────────────
+//
+// Soroban persistent storage entries expire after their TTL (time-to-live)
+// lapses. We extend TTL on every write so that active contract state never
+// becomes inaccessible under normal usage patterns.
+//
+// Ledger cadence on Stellar is ~5 seconds, so:
+//   MIN_TTL = 100_000 ledgers ≈ ~6 days   (minimum acceptable TTL before extension)
+//   MAX_TTL = 535_000 ledgers ≈ ~31 days  (target TTL after extension)
+//
+// These values align with Soroban's recommended persistent-storage strategy:
+// extend whenever the remaining TTL drops below MIN_TTL, pushing it out to MAX_TTL.
+const MIN_TTL: u32 = 100_000;
+const MAX_TTL: u32 = 535_000;
 
 #[contractimpl]
 impl TokenFactory {
@@ -70,6 +103,7 @@ impl TokenFactory {
         let state = FactoryState {
             admin: admin.clone(),
             paused: false,
+            locked: false,
             treasury,
             fee_token,
             base_fee,
@@ -78,20 +112,30 @@ impl TokenFactory {
         };
         env.storage().instance().set(&symbol_short!("state"), &state);
         env.storage().instance().set(&symbol_short!("init"), &true);
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
         env.events().publish((symbol_short!("init"),), (admin,));
         Ok(())
     }
 
-    fn load_state(env: &Env) -> FactoryState {
-        env.storage().instance().get(&symbol_short!("state")).unwrap()
+    fn load_state(env: &Env) -> Result<FactoryState, Error> {
+        env.storage().instance().get(&symbol_short!("state")).ok_or(Error::StateNotFound)
     }
 
     fn save_state(env: &Env, state: &FactoryState) {
         env.storage().instance().set(&symbol_short!("state"), state);
+        // Extend instance TTL on every state write so the contract never expires.
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+    }
+
+    /// Extend TTL for all per-token storage keys associated with `token_address`
+    /// and `index`. Called after any write that touches token-specific entries.
+    fn extend_token_ttl(env: &Env, token_address: &Address, index: u32) {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        let _ = (token_address, index); // keys live in instance storage; one call covers all
     }
 
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::load_state(env).paused {
+        if Self::load_state(env)?.paused {
             return Err(Error::ContractPaused);
         }
         Ok(())
@@ -113,14 +157,52 @@ impl TokenFactory {
         Self::require_not_paused(&env)?;
         creator.require_auth();
 
-        let mut state = Self::load_state(&env);
+        let mut state = Self::load_state(&env)?;
+
+        // Reentrancy guard: reject if a create_token call is already in progress.
+        if state.locked {
+            return Err(Error::Reentrancy);
+        }
+        state.locked = true;
+        Self::save_state(&env, &state);
+
+        let result = Self::create_token_inner(&env, creator, salt, token_wasm_hash, name, symbol, decimals, initial_supply, fee_payment, &mut state);
+
+        // Always release the lock, regardless of success or error.
+        state.locked = false;
+        Self::save_state(&env, &state);
+
+        result
+    }
+
+    fn create_token_inner(
+        env: &Env,
+        creator: Address,
+        salt: BytesN<32>,
+        token_wasm_hash: BytesN<32>,
+        name: String,
+        symbol: String,
+        decimals: u32,
+        initial_supply: i128,
+        fee_payment: i128,
+        state: &mut FactoryState,
+    ) -> Result<Address, Error> {
+        // Validate token name: non-empty and at most 32 characters
+        if name.len() == 0 || name.len() > 32 {
+            return Err(Error::InvalidParameters);
+        }
+
+        // Validate token symbol: non-empty and at most 12 characters
+        if symbol.len() == 0 || symbol.len() > 12 {
+            return Err(Error::InvalidParameters);
+        }
 
         if fee_payment < state.base_fee {
             return Err(Error::InsufficientFee);
         }
 
         // Transfer fee to treasury using the stored fee token
-        token::TokenClient::new(&env, &state.fee_token).transfer(
+        token::TokenClient::new(env, &state.fee_token).transfer(
             &creator,
             &state.treasury,
             &fee_payment,
@@ -133,7 +215,7 @@ impl TokenFactory {
             .deploy(token_wasm_hash);
 
         // Initialize the deployed token
-        TokenInitClient::new(&env, &token_address).initialize(
+        TokenInitClient::new(env, &token_address).initialize(
             &creator,
             &decimals,
             &name,
@@ -142,10 +224,13 @@ impl TokenFactory {
 
         // Mint initial supply to creator if requested
         if initial_supply > 0 {
-            token::StellarAssetClient::new(&env, &token_address).mint(&creator, &initial_supply);
+            token::StellarAssetClient::new(env, &token_address).mint(&creator, &initial_supply);
         }
 
-        state.token_count += 1;
+        // Increment token_count with overflow check
+        let new_count = state.token_count.checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        state.token_count = new_count;
         let index = state.token_count;
 
         env.storage().instance().set(&index, &TokenInfo {
@@ -156,19 +241,21 @@ impl TokenFactory {
             created_at: env.ledger().timestamp(),
             burn_enabled: true,
         });
-        Self::save_state(&env, &state);
 
         let creator_key = (symbol_short!("crtoks"), creator.clone());
         let mut list: Vec<u32> = env
             .storage()
             .instance()
             .get(&creator_key)
-            .unwrap_or_else(|| vec![&env]);
+            .unwrap_or_else(|| vec![env]);
         list.push_back(index);
         env.storage().instance().set(&creator_key, &list);
 
         // Store reverse mapping: token_address -> index (for burn_enabled lookup)
         env.storage().instance().set(&(&token_address, symbol_short!("idx")), &index);
+
+        // Extend TTL for all token-related storage entries written above.
+        Self::extend_token_ttl(env, &token_address, index);
 
         env.events()
             .publish((symbol_short!("created"),), (token_address.clone(), creator, index));
@@ -185,7 +272,7 @@ impl TokenFactory {
         Self::require_not_paused(&env)?;
         admin.require_auth();
 
-        let state = Self::load_state(&env);
+        let state = Self::load_state(&env)?;
 
         if fee_payment < state.metadata_fee {
             return Err(Error::InsufficientFee);
@@ -225,6 +312,9 @@ impl TokenFactory {
             .instance()
             .set(&(&token_address, symbol_short!("meta")), &metadata_uri);
 
+        // Extend TTL so the metadata entry remains accessible.
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+
         env.events()
             .publish((symbol_short!("meta"),), (token_address, metadata_uri));
         Ok(())
@@ -241,7 +331,12 @@ impl TokenFactory {
         Self::require_not_paused(&env)?;
         admin.require_auth();
 
-        let state = Self::load_state(&env);
+        // Validate mint amount is positive and doesn't overflow
+        if amount <= 0 {
+            return Err(Error::InvalidParameters);
+        }
+
+        let state = Self::load_state(&env)?;
 
         if fee_payment < state.base_fee {
             return Err(Error::InsufficientFee);
@@ -300,7 +395,7 @@ impl TokenFactory {
         // Check burn_enabled via reverse index lookup before burning
         let idx_key = (&token_address, symbol_short!("idx"));
         if let Some(index) = env.storage().instance().get::<_, u32>(&idx_key) {
-            let info: TokenInfo = env.storage().instance().get(&index).unwrap();
+            let info: TokenInfo = env.storage().instance().get(&index).ok_or(Error::TokenNotFound)?;
             if !info.burn_enabled {
                 return Err(Error::BurnNotEnabled);
             }
@@ -329,7 +424,7 @@ impl TokenFactory {
             .get(&idx_key)
             .ok_or(Error::TokenNotFound)?;
 
-        let mut info: TokenInfo = env.storage().instance().get(&index).unwrap();
+        let mut info: TokenInfo = env.storage().instance().get(&index).ok_or(Error::TokenNotFound)?;
 
         if info.creator != admin {
             return Err(Error::Unauthorized);
@@ -337,12 +432,14 @@ impl TokenFactory {
 
         info.burn_enabled = enabled;
         env.storage().instance().set(&index, &info);
+        // Extend TTL so the updated token info remains accessible.
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
         Ok(())
     }
 
     pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
-        let mut state = Self::load_state(&env);
+        let mut state = Self::load_state(&env)?;
         if state.admin != admin {
             return Err(Error::Unauthorized);
         }
@@ -353,7 +450,7 @@ impl TokenFactory {
 
     pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
-        let mut state = Self::load_state(&env);
+        let mut state = Self::load_state(&env)?;
         if state.admin != admin {
             return Err(Error::Unauthorized);
         }
@@ -369,7 +466,7 @@ impl TokenFactory {
         metadata_fee: Option<i128>,
     ) -> Result<(), Error> {
         admin.require_auth();
-        let mut state = Self::load_state(&env);
+        let mut state = Self::load_state(&env)?;
         if admin != state.admin {
             return Err(Error::Unauthorized);
         }
@@ -385,9 +482,28 @@ impl TokenFactory {
         Ok(())
     }
 
+    /// Upgrade the contract WASM to a new hash. Only the admin can call this.
+    /// Contract state is preserved; call `migrate()` afterwards if state layout changes.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin.require_auth();
+        let state = Self::load_state(&env)?;
+        if state.admin != admin {
+            return Err(Error::Unauthorized);
+        }
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Stub for future state migrations after an upgrade.
+    /// Extend this function when a WASM upgrade requires data layout changes.
+    pub fn migrate(_env: Env, _admin: Address) -> Result<(), Error> {
+        // No-op until a migration is required.
+        Ok(())
+    }
+
     pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
         admin.require_auth();
-        let mut state = Self::load_state(&env);
+        let mut state = Self::load_state(&env)?;
         if state.admin != admin {
             return Err(Error::Unauthorized);
         }
@@ -399,16 +515,16 @@ impl TokenFactory {
         Ok(())
     }
 
-    pub fn get_state(env: Env) -> FactoryState {
+    pub fn get_state(env: Env) -> Result<FactoryState, Error> {
         Self::load_state(&env)
     }
 
-    pub fn get_base_fee(env: Env) -> i128 {
-        Self::load_state(&env).base_fee
+    pub fn get_base_fee(env: Env) -> Result<i128, Error> {
+        Ok(Self::load_state(&env)?.base_fee)
     }
 
-    pub fn get_metadata_fee(env: Env) -> i128 {
-        Self::load_state(&env).metadata_fee
+    pub fn get_metadata_fee(env: Env) -> Result<i128, Error> {
+        Ok(Self::load_state(&env)?.metadata_fee)
     }
 
     pub fn get_token_info(env: Env, index: u32) -> Result<TokenInfo, Error> {
